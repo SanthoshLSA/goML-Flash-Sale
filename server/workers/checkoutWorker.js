@@ -1,10 +1,15 @@
 const { Worker } = require('bullmq');
+const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const Order = require('../models/Order');
 const { releaseItem } = require('../services/redisInventory');
 const { QUEUE_NAME, registerMemoryWorker, setOrderStatus } = require('../services/queueService');
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+
+// In-memory orders and inventory fallback when running without MongoDB
+const mockOrders = new Map();
+let mockStock = 500;
 
 /**
  * Core business logic: Process checkout job with atomic MongoDB conditional write
@@ -14,14 +19,22 @@ const processCheckoutJob = async (job) => {
   console.log(`[Worker] Processing checkout job ${trackingId} for user ${userId}, product ${productId}`);
 
   try {
+    const isDbConnected = mongoose.connection.readyState === 1;
+
     // 1. Idempotency Check: Avoid processing duplicate orders
     if (idempotencyKey) {
-      const existingOrder = await Order.findOne({ idempotencyKey });
-      if (existingOrder) {
-        console.log(`[Worker] Idempotency match found for key ${idempotencyKey}. Reusing order status.`);
-        await setOrderStatus(trackingId, existingOrder.status, {
-          orderId: existingOrder._id,
-        });
+      if (isDbConnected) {
+        const existingOrder = await Order.findOne({ idempotencyKey });
+        if (existingOrder) {
+          console.log(`[Worker] Idempotency match found for key ${idempotencyKey}. Reusing order status.`);
+          await setOrderStatus(trackingId, existingOrder.status, {
+            orderId: existingOrder._id,
+          });
+          return;
+        }
+      } else if (mockOrders.has(idempotencyKey)) {
+        const existing = mockOrders.get(idempotencyKey);
+        await setOrderStatus(trackingId, existing.status, { orderId: existing.orderId });
         return;
       }
     }
@@ -29,31 +42,44 @@ const processCheckoutJob = async (job) => {
     // 2. ATOMIC MONGODB CONDITIONAL DECREMENT (Document-level lock equivalent to WHERE stock > 0)
     // Guarantees zero overselling even if Redis layer ever drifted
     let updatedProduct = null;
-    try {
-      updatedProduct = await Product.findOneAndUpdate(
-        { _id: productId, stock: { $gt: 0 } },
-        { $inc: { stock: -1 } },
-        { new: true }
-      );
-    } catch (dbErr) {
-      console.warn(`[Worker] MongoDB update error: ${dbErr.message}`);
+    if (isDbConnected) {
+      try {
+        updatedProduct = await Product.findOneAndUpdate(
+          { _id: productId, stock: { $gt: 0 } },
+          { $inc: { stock: -1 } },
+          { new: true }
+        );
+      } catch (dbErr) {
+        console.warn(`[Worker] MongoDB update error: ${dbErr.message}`);
+      }
+    } else {
+      // In-memory atomic decrement (single-threaded JS event loop guarantee)
+      if (mockStock > 0) {
+        mockStock -= 1;
+        updatedProduct = { _id: productId, stock: mockStock };
+      }
     }
 
     if (updatedProduct) {
-      // Stock successfully decremented in MongoDB!
-      const order = await Order.create({
-        trackingId,
-        userId,
-        productId,
-        status: 'CONFIRMED',
-        idempotencyKey,
-        confirmedAt: new Date(),
-      });
+      let orderId = `ord_${Math.random().toString(36).substring(2, 9)}`;
+      if (isDbConnected) {
+        const order = await Order.create({
+          trackingId,
+          userId,
+          productId,
+          status: 'CONFIRMED',
+          idempotencyKey,
+          confirmedAt: new Date(),
+        });
+        orderId = order._id;
+      } else {
+        mockOrders.set(idempotencyKey || trackingId, { status: 'CONFIRMED', orderId });
+      }
 
-      console.log(`[Worker] Order CONFIRMED: ${order._id}. Remaining MongoDB stock: ${updatedProduct.stock}`);
+      console.log(`[Worker] Order CONFIRMED: ${orderId}. Remaining stock: ${updatedProduct.stock}`);
 
       await setOrderStatus(trackingId, 'CONFIRMED', {
-        orderId: order._id,
+        orderId,
         remainingStock: updatedProduct.stock,
       });
     } else {

@@ -157,4 +157,5 @@ module.exports = {
   reserveItem,
   releaseItem,
   getStock,
+  isRedisConnected: () => isConnected,
 };

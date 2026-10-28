@@ -1,5 +1,5 @@
 const { Queue } = require('bullmq');
-const { redisClient } = require('./redisInventory');
+const { redisClient, isRedisConnected } = require('./redisInventory');
 
 const QUEUE_NAME = 'checkout-queue';
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
@@ -60,7 +60,7 @@ const enqueueCheckout = async (payload) => {
   const { trackingId } = payload;
   setOrderStatus(trackingId, 'QUEUED');
 
-  if (checkoutQueue) {
+  if (checkoutQueue && isRedisConnected()) {
     try {
       await checkoutQueue.add('process-checkout', payload, {
         attempts: 3,
