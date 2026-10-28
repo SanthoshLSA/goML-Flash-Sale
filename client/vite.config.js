@@ -12,9 +12,4 @@ export default defineConfig({
       },
     },
   },
-  build: {
-    // Keep bundle size under 200KB as required by the case study
-    minify: 'esbuild',
-    target: 'es2020',
-  },
 });

@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "seed": "node scripts/seed.js"
+    "seed": "node seed.js",
+    "test": "node test.js"
   },
   "dependencies": {
     "bullmq": "^5.34.0",
@@ -15,7 +16,7 @@
     "express": "^4.21.1",
     "express-rate-limit": "^7.4.1",
     "ioredis": "^5.4.2",
-    "pg": "^8.23.1",
+    "pg": "^8.13.1",
     "uuid": "^11.0.3"
   }
 }

@@ -1,35 +1,29 @@
 import { useState, useRef, useCallback } from 'react';
 
-/**
- * useThrottle Hook
- * Locks execution immediately upon the first trigger to prevent API spamming,
- * duplicate payloads, and multiple click events.
- */
-export function useThrottle(callback, delay = 3000) {
-  const [isLocked, setIsLocked] = useState(false);
-  const lastExecutedRef = useRef(0);
+export function useThrottle(fn, delay = 3000) {
+  const [locked, setLocked] = useState(false);
+  const lastTime = useRef(0);
 
   const execute = useCallback(
     async (...args) => {
       const now = Date.now();
-
-      if (now - lastExecutedRef.current < delay) {
-        return; // Throttled: Ignore repetitive clicks
+      if (now - lastTime.current < delay) {
+        return;
       }
 
-      lastExecutedRef.current = now;
-      setIsLocked(true);
+      lastTime.current = now;
+      setLocked(true);
 
       try {
-        await callback(...args);
+        await fn(...args);
       } finally {
         setTimeout(() => {
-          setIsLocked(false);
+          setLocked(false);
         }, delay);
       }
     },
-    [callback, delay]
+    [fn, delay]
   );
 
-  return { execute, isLocked };
+  return { execute, locked };
 }

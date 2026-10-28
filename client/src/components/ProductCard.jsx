@@ -6,11 +6,11 @@ import { useSSE } from '../hooks/useSSE';
 
 export default function ProductCard({ product }) {
   const [activeTrackingId, setActiveTrackingId] = useState(null);
-  const { stock, isConnected, setStock } = useSSE(product._id, product.stock);
+  const { stock, setStock } = useSSE(product.id, product.stock);
 
   const handleReset = async () => {
     try {
-      const res = await fetch(`/api/products/${product._id}/reset`, {
+      const res = await fetch(`/api/products/${product.id}/reset`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stock: 500 }),
@@ -18,113 +18,69 @@ export default function ProductCard({ product }) {
       const data = await res.json();
       setStock(data.stock);
       setActiveTrackingId(null);
-    } catch (err) {
-      console.error('Failed to reset inventory', err);
-    }
+    } catch (err) {}
   };
 
   return (
     <div style={{
-      maxWidth: '520px',
+      maxWidth: '480px',
       margin: '0 auto',
       background: 'var(--bg-card)',
-      borderRadius: '20px',
+      borderRadius: '16px',
       border: '1px solid var(--border)',
       overflow: 'hidden',
-      boxShadow: '0 20px 40px rgba(0, 0, 0, 0.4)',
     }}>
-      {/* Product Image Banner */}
-      <div style={{ position: 'relative', height: '240px', background: '#0e1422' }}>
+      <div style={{ height: '220px', background: '#090d16' }}>
         <img
-          src={product.imageUrl || 'https://images.unsplash.com/photo-1592899677977-9c10ca588bbd?w=800&auto=format&fit=crop&q=80'}
+          src={product.image_url || 'https://images.unsplash.com/photo-1592899677977-9c10ca588bbd?w=800&auto=format&fit=crop&q=80'}
           alt={product.name}
           style={{ width: '100%', height: '100%', objectFit: 'cover' }}
         />
-        <div style={{
-          position: 'absolute',
-          top: '16px',
-          left: '16px',
-          backgroundColor: 'rgba(0,0,0,0.75)',
-          backdropFilter: 'blur(8px)',
-          padding: '6px 12px',
-          borderRadius: '20px',
-          fontSize: '12px',
-          fontWeight: 700,
-          color: 'var(--accent-gold)',
-          border: '1px solid var(--accent-gold)',
-        }}>
-          🔥 FESTIVAL FLASH DROP • 8:00 PM
-        </div>
       </div>
 
       <div style={{ padding: '24px' }}>
-        <h2 style={{ fontSize: '22px', fontWeight: 800, color: 'var(--text-main)', marginBottom: '8px' }}>
+        <h2 style={{ fontSize: '20px', fontWeight: 700, marginBottom: '8px' }}>
           {product.name}
         </h2>
         <p style={{ fontSize: '14px', color: 'var(--text-muted)', marginBottom: '16px', lineHeight: 1.5 }}>
           {product.description}
         </p>
 
-        {/* Pricing */}
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: '12px', marginBottom: '20px' }}>
-          <span style={{ fontSize: '32px', fontWeight: 900, color: 'var(--accent-gold)' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', marginBottom: '16px' }}>
+          <span style={{ fontSize: '28px', fontWeight: 800, color: 'var(--accent-gold)' }}>
             ${product.price}
           </span>
-          <span style={{ fontSize: '16px', color: 'var(--text-muted)', textDecoration: 'line-through' }}>
+          <span style={{ fontSize: '15px', color: 'var(--text-muted)', textDecoration: 'line-through' }}>
             $1,199
-          </span>
-          <span style={{
-            fontSize: '12px',
-            background: 'rgba(239, 68, 68, 0.2)',
-            color: 'var(--accent-red)',
-            padding: '2px 8px',
-            borderRadius: '6px',
-            fontWeight: 700
-          }}>
-            SAVE 42%
           </span>
         </div>
 
-        {/* Real-time SSE Stock Counter */}
         <StockCounter
           stock={stock}
-          totalInitialStock={product.totalInitialStock || 500}
-          isConnected={isConnected}
+          totalInitialStock={product.total_initial_stock || 500}
         />
 
-        {/* Throttled Buy Button */}
         <BuyButton
-          productId={product._id}
+          productId={product.id}
           stock={stock}
-          onOrderQueued={(trackingId) => setActiveTrackingId(trackingId)}
+          onOrderQueued={(id) => setActiveTrackingId(id)}
         />
 
-        {/* Polling Order Tracker */}
-        {activeTrackingId && (
-          <OrderTracker
-            trackingId={activeTrackingId}
-            onComplete={(res) => {
-              console.log('Order finalized:', res);
-            }}
-          />
-        )}
+        {activeTrackingId && <OrderTracker trackingId={activeTrackingId} />}
 
-        {/* Developer / Interview Demo Controls */}
-        <div style={{ marginTop: '24px', paddingTop: '16px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Demo Control:</span>
+        <div style={{ marginTop: '20px', paddingTop: '12px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end' }}>
           <button
             onClick={handleReset}
             style={{
               background: 'transparent',
-              border: '1px solid var(--border)',
+              border: 'none',
               color: 'var(--text-muted)',
               fontSize: '11px',
-              padding: '4px 10px',
-              borderRadius: '6px',
-              cursor: 'pointer'
+              cursor: 'pointer',
+              textDecoration: 'underline',
             }}
           >
-            🔄 Reset Inventory to 500
+            Reset stock to 500
           </button>
         </div>
       </div>
