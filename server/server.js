@@ -1,9 +1,9 @@
 require('dotenv').config();
 const http = require('http');
 const app = require('./app');
-const connectDB = require('./config/db');
+const { initDB } = require('./config/db');
 const { startCheckoutWorker } = require('./workers/checkoutWorker');
-const Product = require('./models/Product');
+const ProductModel = require('./models/productModel');
 const { initializeInventory } = require('./services/redisInventory');
 
 const PORT = process.env.PORT || 3000;
@@ -13,19 +13,17 @@ const startServer = async () => {
   console.log('⚡ Starting Flash-Sale High-Concurrency Backend API');
   console.log('----------------------------------------------------');
 
-  // 1. Connect MongoDB
-  const conn = await connectDB();
+  // 1. Initialize PostgreSQL Connection & DDL Schema
+  await initDB();
 
   // 2. Initialize background workers for async checkout queue
   startCheckoutWorker();
 
   // 3. Pre-load inventory into Redis/Memory gate
   try {
-    if (conn) {
-      const products = await Product.find({ isActive: true });
-      for (const prod of products) {
-        await initializeInventory(prod._id.toString(), prod.stock);
-      }
+    const products = await ProductModel.findActive();
+    for (const prod of products) {
+      await initializeInventory(prod.id, prod.stock);
     }
   } catch (err) {
     console.warn('[Server] Product inventory pre-sync note:', err.message);

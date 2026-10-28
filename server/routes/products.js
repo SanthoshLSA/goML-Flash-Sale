@@ -1,49 +1,40 @@
 const express = require('express');
-const Product = require('../models/Product');
+const ProductModel = require('../models/productModel');
 const { getStock, initializeInventory } = require('../services/redisInventory');
 
 const router = express.Router();
 
-// Fallback in-memory product if database is not yet seeded
-const DEFAULT_PRODUCT = {
-  _id: 'flash_phone_500',
-  name: 'FlashPhone Ultra 5G (Limited Edition)',
-  description: 'Flagship high-demand festive smartphone. Batch of 500 units only.',
-  price: 699,
-  stock: 500,
-  totalInitialStock: 500,
-  isActive: true,
-  imageUrl: 'https://images.unsplash.com/photo-1592899677977-9c10ca588bbd?w=800&auto=format&fit=crop&q=80',
-};
-
 /**
  * GET /api/products
- * Fetch active flash-sale products
+ * Fetch active flash-sale products from PostgreSQL
  */
 router.get('/', async (req, res) => {
   try {
-    let products = await Product.find({ isActive: true });
-    if (!products || products.length === 0) {
-      // Initialize default product in Redis/memory
-      await initializeInventory(DEFAULT_PRODUCT._id, DEFAULT_PRODUCT.stock);
-      return res.json([DEFAULT_PRODUCT]);
-    }
+    const products = await ProductModel.findActive();
 
-    // Attach latest real-time stock numbers
+    // Attach real-time stock and compatibility fields
     const enriched = await Promise.all(
       products.map(async (p) => {
-        const liveStock = await getStock(p._id.toString());
+        const liveStock = await getStock(p.id);
+        const currentStock = liveStock !== null ? liveStock : parseInt(p.stock, 10);
         return {
-          ...p.toObject(),
-          stock: liveStock !== null ? liveStock : p.stock,
+          _id: p.id,
+          id: p.id,
+          name: p.name,
+          description: p.description,
+          price: parseFloat(p.price),
+          stock: currentStock,
+          totalInitialStock: parseInt(p.total_initial_stock || p.stock, 10),
+          isActive: p.is_active,
+          imageUrl: p.image_url,
         };
       })
     );
 
     return res.json(enriched);
   } catch (error) {
-    console.warn('[API Products] Error querying MongoDB:', error.message);
-    return res.json([DEFAULT_PRODUCT]);
+    console.warn('[API Products] Error querying products:', error.message);
+    return res.json([]);
   }
 });
 
@@ -54,13 +45,10 @@ router.get('/', async (req, res) => {
 router.get('/:id/stock/sse', async (req, res) => {
   const { id } = req.params;
 
-  // Set SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
-
-  console.log(`[SSE] Client subscribed to stock stream for product ${id}`);
 
   let lastSentStock = null;
 
@@ -68,8 +56,8 @@ router.get('/:id/stock/sse', async (req, res) => {
     try {
       let currentStock = await getStock(id);
       if (currentStock === null) {
-        const prod = await Product.findById(id).catch(() => null);
-        currentStock = prod ? prod.stock : 500;
+        const prod = await ProductModel.findById(id);
+        currentStock = prod ? parseInt(prod.stock, 10) : 500;
         await initializeInventory(id, currentStock);
       }
 
@@ -82,15 +70,11 @@ router.get('/:id/stock/sse', async (req, res) => {
     }
   };
 
-  // Immediate initial send
   await sendStockUpdate();
-
-  // Periodic heartbeat interval
   const intervalId = setInterval(sendStockUpdate, 1500);
 
   req.on('close', () => {
     clearInterval(intervalId);
-    console.log(`[SSE] Client disconnected for product ${id}`);
     res.end();
   });
 });
@@ -104,12 +88,7 @@ router.post('/:id/reset', async (req, res) => {
   const count = parseInt(req.body.stock, 10) || 500;
 
   await initializeInventory(id, count);
-
-  try {
-    await Product.findByIdAndUpdate(id, { stock: count, totalInitialStock: count });
-  } catch (e) {
-    //
-  }
+  await ProductModel.resetStock(id, count);
 
   res.json({ message: `Inventory for product ${id} reset to ${count}`, stock: count });
 });

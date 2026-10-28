@@ -42,10 +42,14 @@ This guide breaks down every architectural layer, every file in the codebase, al
 [ Background Consumer Worker Pool ]
   │  Processes queue jobs sequentially without DB contention
   ▼
-[ LAYER 2: MongoDB Persistence Layer ]
-  │  Document-level atomic conditional update:
-  │  `findOneAndUpdate({ _id: id, stock: { $gt: 0 } }, { $inc: { stock: -1 } })`
-  │  Creates Confirmed Order document
+[ LAYER 2: PostgreSQL ACID Persistence Layer ]
+  │  Strict Transaction with Conditional Decrement:
+  │  BEGIN;
+  │  UPDATE products SET stock = stock - 1 WHERE id = $1 AND stock > 0 RETURNING stock;
+  │  INSERT INTO orders (tracking_id, user_id, product_id, status, ...) VALUES (...);
+  │  COMMIT;
+  │
+  │  + Engine Level Guard: CHECK (stock >= 0)
   │  Updates fast tracking cache (Redis key `track:trackingId`)
   ▼
 [ Client Polling / SSE ]
@@ -62,7 +66,7 @@ This guide breaks down every architectural layer, every file in the codebase, al
 |---|---|
 | `package.json` | Root workspace orchestrator using npm workspaces (`server` and `client`). Enables single-command scripts like `npm run dev` to boot both tiers concurrently. |
 | `.gitignore` | Prevents committing `node_modules`, secret `.env` files, build output (`dist/`), and OS temporary files. |
-| `.env.example` | Environment variable specification documenting `MONGO_URI`, `REDIS_URL`, and `PORT`. |
+| `.env.example` | Environment variable specification documenting `DATABASE_URL`, `REDIS_URL`, and `PORT`. |
 | `README.md` | Developer onboarding documentation, quickstart, and API contracts. |
 
 ---
@@ -71,23 +75,23 @@ This guide breaks down every architectural layer, every file in the codebase, al
 
 #### 1. Configuration & Entrypoint
 - **`server/config/db.js`**:
-  - Connects Mongoose to MongoDB with a 2000ms selection timeout.
-  - Automatically disables command buffering (`bufferCommands = false`) if disconnected so operations fail fast instead of hanging the Node event loop.
+  - Connects PostgreSQL connection pool using `pg.Pool`.
+  - Automatically runs DDL migrations: creates `products` and `orders` tables with `CHECK (stock >= 0)` constraint and index structures.
 - **`server/server.js`**:
   - Main bootstrapper.
-  - Sequentially boots database connection, initializes the BullMQ background worker, syncs product inventory into the fast Redis gate, and starts the HTTP listener on port 3000.
+  - Sequentially boots PostgreSQL database schema, initializes the BullMQ background worker, syncs product inventory into the fast Redis gate, and starts the HTTP listener on port 3000.
 - **`server/app.js`**:
   - Express application setup.
   - Registers CORS, JSON body parser, general rate limiting middleware, and health check route `/health`.
   - Mounts routes under `/api/checkout`, `/api/track`, and `/api/products`.
 
 #### 2. Data Models (`server/models/`)
-- **`server/models/Product.js`**:
-  - Schema: `name`, `description`, `price`, `stock`, `totalInitialStock`, `isActive`, `saleStartsAt`, `imageUrl`.
-  - **Index**: Compound index `{ _id: 1, stock: 1 }` to allow MongoDB's WiredTiger storage engine to execute conditional decrement queries via index scans with zero table locking.
-- **`server/models/Order.js`**:
-  - Schema: `trackingId` (UUID), `userId`, `productId`, `status` (`QUEUED`, `CONFIRMED`, `FAILED`, `SOLD_OUT`), `idempotencyKey`, `confirmedAt`.
-  - **Indexes**: Unique index on `trackingId` for fast sub-millisecond polling queries; compound index `{ userId: 1, productId: 1, status: 1 }` to enforce user purchase limits.
+- **`server/models/productModel.js`**:
+  - Queries `products` table: `id`, `name`, `description`, `price`, `stock`, `total_initial_stock`, `is_active`, `image_url`.
+  - Enforces `stock INT NOT NULL CHECK (stock >= 0)` directly at the database engine level.
+- **`server/models/orderModel.js`**:
+  - Queries `orders` table: `id`, `tracking_id`, `user_id`, `product_id`, `status` (`QUEUED`, `CONFIRMED`, `FAILED`, `SOLD_OUT`), `idempotency_key`, `confirmed_at`.
+  - Unique index on `tracking_id` for fast sub-millisecond polling queries; compound index `{ user_id, product_id, status }` to prevent duplicate checkout submissions.
 
 #### 3. Services & Infrastructure (`server/services/`)
 - **`server/services/redisInventory.js`**:
@@ -113,16 +117,18 @@ This guide breaks down every architectural layer, every file in the codebase, al
 - **`server/workers/checkoutWorker.js`**:
   - Asynchronous worker pulling jobs from BullMQ with a concurrency limit of 5 (protecting database connection pool saturation).
   - Checks `idempotencyKey` to avoid double-processing.
-  - Executes MongoDB's conditional atomic decrement:
-    ```javascript
-    Product.findOneAndUpdate(
-      { _id: productId, stock: { $gt: 0 } },
-      { $inc: { stock: -1 } },
-      { new: true }
-    );
+  - Executes strict PostgreSQL conditional transaction:
+    ```sql
+    BEGIN;
+    UPDATE products
+    SET stock = stock - 1
+    WHERE id = $1 AND stock > 0
+    RETURNING stock;
+    INSERT INTO orders (tracking_id, user_id, product_id, status, ...) VALUES (...);
+    COMMIT;
     ```
-  - If successful: Creates confirmed order and updates tracking status to `CONFIRMED`.
-  - If failed (stock reached 0): Marks status as `SOLD_OUT` and calls `releaseItem()` to keep Redis and MongoDB perfectly in sync.
+  - If successful: Commits transaction, creates confirmed order, and updates tracking status to `CONFIRMED`.
+  - If failed (stock reached 0): Rolls back transaction, marks status as `SOLD_OUT`, and calls `releaseItem()` to keep Redis and PostgreSQL perfectly in sync.
 - **`server/middleware/rateLimiter.js`**:
   - Express rate limiter using token-bucket algorithm.
   - Limits checkout endpoint to 10 requests per second per IP, protecting the cluster from script bot spam.
@@ -135,7 +141,7 @@ This guide breaks down every architectural layer, every file in the codebase, al
   - If reserved: Enqueues job in BullMQ and immediately responds with `202 Accepted` + `trackingUrl` in `< 30ms`.
 - **`server/routes/track.js`**:
   - `GET /api/track/:trackingId`
-  - Polling endpoint. Checks Redis fast cache first (< 1ms). Falls back to MongoDB query only if cache missed.
+  - Polling endpoint. Checks Redis fast cache first (< 1ms). Falls back to PostgreSQL query only if cache missed.
 - **`server/routes/products.js`**:
   - `GET /api/products`: Returns active flash-sale items with real-time stock counts.
   - `GET /api/products/:id/stock/sse`: Server-Sent Events (SSE) persistent HTTP connection streaming inventory updates every 1.5 seconds.
@@ -169,14 +175,14 @@ This guide breaks down every architectural layer, every file in the codebase, al
 
 ## 3. Key Design Decisions & Why They Were Chosen
 
-### Decision 1: Two-Layer Defense (Redis Token Gate + MongoDB Conditional Write)
-- **Why not MongoDB alone?**
-  - If 100,000 requests hit MongoDB concurrently, 100,000 queries attempt to acquire document write locks simultaneously. This causes connection pool exhaustion, CPU thrashing, and request timeouts.
+### Decision 1: Two-Layer Defense (Redis Token Gate + PostgreSQL Conditional Write)
+- **Why not PostgreSQL alone?**
+  - If 100,000 requests hit PostgreSQL concurrently, 100,000 queries attempt to acquire row write locks simultaneously. This causes row lock contention, connection pool exhaustion, CPU thrashing, and transaction timeouts.
 - **Why not Redis alone?**
   - Redis is in-memory. If Redis restarts or experiences network partitioning, memory tokens could be lost.
 - **The Two-Layer Solution**:
   - **Redis Layer**: Absorbs the shock. Rejects 99,500 requests in RAM in microseconds.
-  - **MongoDB Layer**: Receives only ~500 sequential writes from the queue. Executes `findOneAndUpdate({ stock: { $gt: 0 } })` as the ACID source of truth.
+  - **PostgreSQL Layer**: Receives only ~500 sequential writes from the queue. Executes `UPDATE products SET stock = stock - 1 WHERE id = $1 AND stock > 0` inside an ACID transaction + enforces `CHECK (stock >= 0)`.
 
 ### Decision 2: Asynchronous Queue (BullMQ) & HTTP 202 Accepted
 - In traditional e-commerce, the client waits for the database write, payment validation, and email notification before the HTTP response returns (`200 OK`). Under 100K traffic, this causes HTTP thread starvation.

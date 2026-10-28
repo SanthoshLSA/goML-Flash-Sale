@@ -1,6 +1,6 @@
 const express = require('express');
 const { getOrderStatus } = require('../services/queueService');
-const Order = require('../models/Order');
+const OrderModel = require('../models/orderModel');
 
 const router = express.Router();
 
@@ -21,14 +21,14 @@ router.get('/:trackingId', async (req, res) => {
       });
     }
 
-    // 2. Fallback to MongoDB if not present in fast cache
-    const dbOrder = await Order.findOne({ trackingId });
+    // 2. Fallback to PostgreSQL if not present in fast cache
+    const dbOrder = await OrderModel.findByTrackingId(trackingId);
     if (dbOrder) {
       return res.json({
         trackingId,
         status: dbOrder.status,
-        orderId: dbOrder._id,
-        confirmedAt: dbOrder.confirmedAt,
+        orderId: dbOrder.id,
+        confirmedAt: dbOrder.confirmed_at,
       });
     }
 

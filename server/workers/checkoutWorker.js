@@ -1,105 +1,134 @@
 const { Worker } = require('bullmq');
-const mongoose = require('mongoose');
-const Product = require('../models/Product');
-const Order = require('../models/Order');
+const { pool, isPostgresConnected } = require('../config/db');
+const OrderModel = require('../models/orderModel');
 const { releaseItem } = require('../services/redisInventory');
 const { QUEUE_NAME, registerMemoryWorker, setOrderStatus } = require('../services/queueService');
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
-// In-memory orders and inventory fallback when running without MongoDB
-const mockOrders = new Map();
+// In-memory fallback tracking when PostgreSQL is not connected locally
 let mockStock = 500;
 
 /**
- * Core business logic: Process checkout job with atomic MongoDB conditional write
+ * Core business logic: Process checkout job with atomic PostgreSQL conditional transaction
+ * Follows Phase C of reference solution:
+ * BEGIN;
+ * UPDATE products SET stock = stock - 1 WHERE id = $1 AND stock > 0 RETURNING stock;
+ * INSERT INTO orders ...;
+ * COMMIT;
  */
 const processCheckoutJob = async (job) => {
   const { trackingId, userId, productId, idempotencyKey } = job.data;
   console.log(`[Worker] Processing checkout job ${trackingId} for user ${userId}, product ${productId}`);
 
   try {
-    const isDbConnected = mongoose.connection.readyState === 1;
-
     // 1. Idempotency Check: Avoid processing duplicate orders
     if (idempotencyKey) {
-      if (isDbConnected) {
-        const existingOrder = await Order.findOne({ idempotencyKey });
-        if (existingOrder) {
-          console.log(`[Worker] Idempotency match found for key ${idempotencyKey}. Reusing order status.`);
-          await setOrderStatus(trackingId, existingOrder.status, {
-            orderId: existingOrder._id,
-          });
-          return;
-        }
-      } else if (mockOrders.has(idempotencyKey)) {
-        const existing = mockOrders.get(idempotencyKey);
-        await setOrderStatus(trackingId, existing.status, { orderId: existing.orderId });
+      const existingOrder = await OrderModel.findByIdempotencyKey(idempotencyKey);
+      if (existingOrder) {
+        console.log(`[Worker] Idempotency match found for key ${idempotencyKey}. Reusing order status.`);
+        await setOrderStatus(trackingId, existingOrder.status, {
+          orderId: existingOrder.id,
+        });
         return;
       }
     }
 
-    // 2. ATOMIC MONGODB CONDITIONAL DECREMENT (Document-level lock equivalent to WHERE stock > 0)
-    // Guarantees zero overselling even if Redis layer ever drifted
-    let updatedProduct = null;
-    if (isDbConnected) {
+    // 2. ATOMIC POSTGRESQL CONDITIONAL DECREMENT TRANSACTION
+    if (isPostgresConnected() && pool) {
+      const client = await pool.connect();
       try {
-        updatedProduct = await Product.findOneAndUpdate(
-          { _id: productId, stock: { $gt: 0 } },
-          { $inc: { stock: -1 } },
-          { new: true }
+        await client.query('BEGIN');
+
+        // Conditional SQL update: strictly guarantees stock never goes below zero
+        const updateRes = await client.query(
+          `UPDATE products
+           SET stock = stock - 1
+           WHERE id = $1 AND stock > 0
+           RETURNING stock`,
+          [productId]
         );
-      } catch (dbErr) {
-        console.warn(`[Worker] MongoDB update error: ${dbErr.message}`);
-      }
-    } else {
-      // In-memory atomic decrement (single-threaded JS event loop guarantee)
-      if (mockStock > 0) {
-        mockStock -= 1;
-        updatedProduct = { _id: productId, stock: mockStock };
+
+        if (updateRes.rowCount > 0) {
+          const remainingStock = updateRes.rows[0].stock;
+
+          const orderRes = await client.query(
+            `INSERT INTO orders (tracking_id, user_id, product_id, status, idempotency_key, confirmed_at)
+             VALUES ($1, $2, $3, 'CONFIRMED', $4, NOW())
+             RETURNING id`,
+            [trackingId, userId, productId, idempotencyKey || null]
+          );
+
+          await client.query('COMMIT');
+
+          const orderId = orderRes.rows[0].id;
+          console.log(`[Worker] PostgreSQL Order CONFIRMED: ${orderId}. Remaining stock: ${remainingStock}`);
+
+          await setOrderStatus(trackingId, 'CONFIRMED', {
+            orderId,
+            remainingStock,
+          });
+          return;
+        } else {
+          // Stock was already 0 when this transaction ran
+          await client.query('ROLLBACK');
+          console.warn(`[Worker] Stock depleted in PostgreSQL for product ${productId}. Marking order as SOLD_OUT.`);
+
+          await OrderModel.create({
+            trackingId,
+            userId,
+            productId,
+            status: 'SOLD_OUT',
+            idempotencyKey,
+            failureReason: 'Stock depleted at PostgreSQL conditional check',
+          });
+
+          await setOrderStatus(trackingId, 'SOLD_OUT', {
+            reason: 'Item sold out during processing',
+          });
+
+          // Sync Redis token count
+          await releaseItem(productId, userId);
+          return;
+        }
+      } catch (txErr) {
+        await client.query('ROLLBACK');
+        throw txErr;
+      } finally {
+        client.release();
       }
     }
 
-    if (updatedProduct) {
-      let orderId = `ord_${Math.random().toString(36).substring(2, 9)}`;
-      if (isDbConnected) {
-        const order = await Order.create({
-          trackingId,
-          userId,
-          productId,
-          status: 'CONFIRMED',
-          idempotencyKey,
-          confirmedAt: new Date(),
-        });
-        orderId = order._id;
-      } else {
-        mockOrders.set(idempotencyKey || trackingId, { status: 'CONFIRMED', orderId });
-      }
+    // Fallback: In-memory atomic decrement (single-threaded Node event-loop safe)
+    if (mockStock > 0) {
+      mockStock -= 1;
+      const order = await OrderModel.create({
+        trackingId,
+        userId,
+        productId,
+        status: 'CONFIRMED',
+        idempotencyKey,
+        confirmedAt: new Date(),
+      });
 
-      console.log(`[Worker] Order CONFIRMED: ${orderId}. Remaining stock: ${updatedProduct.stock}`);
-
+      console.log(`[Worker] Order CONFIRMED: ${order.id}. Remaining stock: ${mockStock}`);
       await setOrderStatus(trackingId, 'CONFIRMED', {
-        orderId,
-        remainingStock: updatedProduct.stock,
+        orderId: order.id,
+        remainingStock: mockStock,
       });
     } else {
-      // Stock was 0 in MongoDB (or product not found)
-      console.warn(`[Worker] Stock depleted in MongoDB for product ${productId}. Marking order as SOLD_OUT.`);
-
-      await Order.create({
+      await OrderModel.create({
         trackingId,
         userId,
         productId,
         status: 'SOLD_OUT',
         idempotencyKey,
-        failureReason: 'Inventory depleted at persistence check',
-      }).catch(() => {});
+        failureReason: 'Inventory depleted',
+      });
 
       await setOrderStatus(trackingId, 'SOLD_OUT', {
         reason: 'Item sold out during processing',
       });
-
-      // Synchronize Redis state in case Redis counter had an extra credit
       await releaseItem(productId, userId);
     }
   } catch (error) {
@@ -115,7 +144,6 @@ const processCheckoutJob = async (job) => {
  * Initialize BullMQ Worker and register fallback memory processor
  */
 const startCheckoutWorker = () => {
-  // Always register in-memory handler for seamless local execution
   registerMemoryWorker(processCheckoutJob);
 
   try {
@@ -129,7 +157,7 @@ const startCheckoutWorker = () => {
 
     const worker = new Worker(QUEUE_NAME, processCheckoutJob, {
       connection,
-      concurrency: 5, // Safe concurrency limit for database pool
+      concurrency: 5,
     });
 
     worker.on('completed', (job) => {
