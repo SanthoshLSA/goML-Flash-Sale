@@ -1,4 +1,17 @@
+const { start } = require('./server');
+
+async function ensureServer() {
+  try {
+    const res = await fetch('http://localhost:3000/health');
+    if (res.ok) return null;
+  } catch (e) {}
+
+  return await start();
+}
+
 async function runTest() {
+  await ensureServer();
+
   const prodRes = await fetch('http://localhost:3000/api/products');
   const products = await prodRes.json();
   const target = products[0];

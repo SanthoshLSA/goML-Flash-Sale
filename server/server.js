@@ -24,9 +24,17 @@ const start = async () => {
     }
   } catch (e) {}
 
-  app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  return new Promise((resolve) => {
+    const server = app.listen(PORT, () => {
+      resolve(server);
+    });
   });
 };
 
-start();
+if (require.main === module) {
+  start().then(() => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = { app, start };
