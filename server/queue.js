@@ -1,3 +1,7 @@
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
+require('dotenv').config();
+
 const { Queue, Worker } = require('bullmq');
 const { pool, isPostgresConnected, getOrderByIdempotencyKey, saveOrder } = require('./db');
 const { isRedisConnected, releaseStock, setTrackingStatus } = require('./redis');
@@ -5,20 +9,24 @@ const { isRedisConnected, releaseStock, setTrackingStatus } = require('./redis')
 const QUEUE_NAME = 'checkout-queue';
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
+const getConnectionOptions = () => {
+  const url = new URL(REDIS_URL.startsWith('redis') ? REDIS_URL : `redis://${REDIS_URL}`);
+  return {
+    host: url.hostname || 'localhost',
+    port: parseInt(url.port, 10) || 6379,
+    password: url.password || undefined,
+    tls: url.protocol === 'rediss:' ? {} : undefined,
+    maxRetriesPerRequest: null,
+  };
+};
+
 let checkoutQueue = null;
 const memoryQueue = [];
 let memoryWorkerActive = false;
 let memoryStock = 500;
 
 try {
-  const url = new URL(REDIS_URL.startsWith('redis') ? REDIS_URL : `redis://${REDIS_URL}`);
-  const connection = {
-    host: url.hostname || 'localhost',
-    port: parseInt(url.port, 10) || 6379,
-    password: url.password || undefined,
-    maxRetriesPerRequest: null,
-  };
-  checkoutQueue = new Queue(QUEUE_NAME, { connection });
+  checkoutQueue = new Queue(QUEUE_NAME, { connection: getConnectionOptions() });
 } catch (e) {}
 
 const processCheckout = async (data) => {
@@ -143,16 +151,8 @@ const startWorker = () => {
   startMemoryWorker();
 
   try {
-    const url = new URL(REDIS_URL.startsWith('redis') ? REDIS_URL : `redis://${REDIS_URL}`);
-    const connection = {
-      host: url.hostname || 'localhost',
-      port: parseInt(url.port, 10) || 6379,
-      password: url.password || undefined,
-      maxRetriesPerRequest: null,
-    };
-
     const worker = new Worker(QUEUE_NAME, async (job) => processCheckout(job.data), {
-      connection,
+      connection: getConnectionOptions(),
       concurrency: 5,
     });
 

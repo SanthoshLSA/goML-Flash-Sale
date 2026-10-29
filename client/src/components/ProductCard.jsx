@@ -13,7 +13,7 @@ export default function ProductCard({ product }) {
       const res = await fetch(`/api/products/${product.id}/reset`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stock: 500 }),
+        body: JSON.stringify({ stock: 5 }),
       });
       const data = await res.json();
       setStock(data.stock);
